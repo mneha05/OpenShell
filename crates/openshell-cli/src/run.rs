@@ -211,44 +211,85 @@ fn current_user_to_json(view: &CurrentUserView) -> serde_json::Value {
 
 /// Validate system prerequisites for running a gateway.
 ///
-/// Checks Docker connectivity and reports the result. Returns exit code 0
-/// if all checks pass, 1 otherwise.
-pub fn doctor_check() -> Result<()> {
+/// Checks connectivity for the selected local container runtime. The explicit
+/// `driver` override takes precedence over `OPENSHELL_COMPUTE_DRIVER`; when
+/// neither is set, Docker remains the default for backwards compatibility.
+pub fn doctor_check(driver: Option<&str>) -> Result<()> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
 
     writeln!(stdout, "Checking system prerequisites...\n").into_diagnostic()?;
 
-    // --- Docker connectivity ---
-    write!(stdout, "  Docker ............. ").into_diagnostic()?;
-    stdout.flush().into_diagnostic()?;
+    let driver = driver
+        .map(str::to_owned)
+        .or_else(|| std::env::var("OPENSHELL_COMPUTE_DRIVER").ok())
+        .unwrap_or_else(|| "docker".to_string());
 
-    let output = Command::new("docker")
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-        .into_diagnostic()
-        .wrap_err("failed to execute docker info")?;
+    match driver.as_str() {
+        "docker" => {
+            write!(stdout, "  Docker ............. ").into_diagnostic()?;
+            stdout.flush().into_diagnostic()?;
 
-    if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout);
-        let version_str = version.trim();
-        writeln!(stdout, "ok (version {version_str})").into_diagnostic()?;
+            let output = Command::new("docker")
+                .args(["info", "--format", "{{.ServerVersion}}"])
+                .output()
+                .into_diagnostic()
+                .wrap_err("failed to execute docker info")?;
 
-        // --- DOCKER_HOST ---
-        write!(stdout, "  DOCKER_HOST ........ ").into_diagnostic()?;
-        match std::env::var("DOCKER_HOST") {
-            Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
-            Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
+            if !output.status.success() {
+                writeln!(stdout, "FAILED").into_diagnostic()?;
+                writeln!(stdout).into_diagnostic()?;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(miette::miette!("docker info failed: {}", stderr.trim()));
+            }
+
+            let version = String::from_utf8_lossy(&output.stdout);
+            writeln!(stdout, "ok (version {})", version.trim()).into_diagnostic()?;
+
+            write!(stdout, "  DOCKER_HOST ........ ").into_diagnostic()?;
+            match std::env::var("DOCKER_HOST") {
+                Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
+                Err(_) => writeln!(stdout, "(not set, using default socket)").into_diagnostic()?,
+            }
         }
+        "podman" => {
+            write!(stdout, "  Podman ............. ").into_diagnostic()?;
+            stdout.flush().into_diagnostic()?;
 
-        writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
-        return Ok(());
+            let output = Command::new("podman")
+                .args(["info", "--format", "{{.Version.Version}}"])
+                .output()
+                .into_diagnostic()
+                .wrap_err("failed to execute podman info")?;
+
+            if !output.status.success() {
+                writeln!(stdout, "FAILED").into_diagnostic()?;
+                writeln!(stdout).into_diagnostic()?;
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(miette::miette!(
+                    "podman info failed: {}\nCheck CONTAINER_HOST (or the active Podman user socket) and run `podman info`.",
+                    stderr.trim()
+                ));
+            }
+
+            let version = String::from_utf8_lossy(&output.stdout);
+            writeln!(stdout, "ok (version {})", version.trim()).into_diagnostic()?;
+
+            write!(stdout, "  CONTAINER_HOST ..... ").into_diagnostic()?;
+            match std::env::var("CONTAINER_HOST") {
+                Ok(val) => writeln!(stdout, "{val}").into_diagnostic()?,
+                Err(_) => writeln!(stdout, "(not set, using default Podman socket)").into_diagnostic()?,
+            }
+        }
+        other => {
+            return Err(miette::miette!(
+                "doctor check supports local Docker and Podman drivers; got '{other}'"
+            ));
+        }
     }
 
-    writeln!(stdout, "FAILED").into_diagnostic()?;
-    writeln!(stdout).into_diagnostic()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(miette::miette!("docker info failed: {}", stderr.trim()))
+    writeln!(stdout, "\nAll checks passed.").into_diagnostic()?;
+    Ok(())
 }
 
 fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
