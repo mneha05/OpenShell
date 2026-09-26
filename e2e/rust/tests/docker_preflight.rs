@@ -53,6 +53,7 @@ async fn run_without_docker(args: &[&str]) -> (String, i32, std::time::Duration)
         .env("DOCKER_HOST", "unix:///tmp/openshell-e2e-nonexistent.sock")
         .env_remove("OPENSHELL_GATEWAY")
         .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .env_remove("OPENSHELL_COMPUTE_DRIVER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -63,6 +64,60 @@ async fn run_without_docker(args: &[&str]) -> (String, i32, std::time::Duration)
     let combined = format!("{stdout}{stderr}");
     let code = output.status.code().unwrap_or(-1);
     (combined, code, elapsed)
+}
+
+async fn run_with_fake_podman(
+    args: &[&str],
+    driver_from_env: bool,
+    succeed: bool,
+) -> (String, i32) {
+    let tmpdir = tempfile::tempdir().expect("create isolated config dir");
+    let bin_dir = tmpdir.path().join("bin");
+    fs::create_dir(&bin_dir).expect("create fake bin dir");
+    let fake_podman = bin_dir.join("podman");
+    let script = if succeed {
+        "#!/bin/sh\n\
+         echo '5.4.2'\n"
+    } else {
+        "#!/bin/sh\n\
+         echo 'Cannot connect to Podman socket.' >&2\n\
+         exit 1\n"
+    };
+    fs::write(&fake_podman, script).expect("write fake podman");
+    #[cfg(unix)]
+    fs::set_permissions(&fake_podman, fs::Permissions::from_mode(0o755))
+        .expect("chmod fake podman");
+
+    let old_path = env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{old_path}", bin_dir.display());
+
+    let mut cmd = openshell_cmd();
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("HOME", tmpdir.path())
+        .env("PATH", path)
+        .env("CONTAINER_HOST", "unix:///tmp/openshell-e2e-podman.sock")
+        .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT");
+
+    if driver_from_env {
+        cmd.env("OPENSHELL_COMPUTE_DRIVER", "podman");
+    } else {
+        cmd.env_remove("OPENSHELL_COMPUTE_DRIVER");
+    }
+
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("spawn openshell");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let code = output.status.code().unwrap_or(-1);
+    (combined, code)
 }
 
 // -------------------------------------------------------------------
@@ -146,6 +201,7 @@ async fn doctor_check_passes_with_docker() {
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
         .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+        .env_remove("OPENSHELL_COMPUTE_DRIVER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -168,4 +224,42 @@ async fn doctor_check_passes_with_docker() {
         clean.contains("ok"),
         "doctor check should show 'ok' for Docker:\n{clean}"
     );
+}
+
+
+#[tokio::test]
+async fn doctor_check_podman_explicit_driver_reports_version() {
+    let (output, code) =
+        run_with_fake_podman(&["doctor", "check", "--driver", "podman"], false, true).await;
+    let clean = strip_ansi(&output);
+
+    assert_eq!(code, 0, "Podman doctor check should pass:\n{clean}");
+    assert!(clean.contains("Podman"), "missing Podman label:\n{clean}");
+    assert!(clean.contains("version 5.4.2"), "missing Podman version:\n{clean}");
+    assert!(
+        clean.contains("CONTAINER_HOST") && clean.contains("openshell-e2e-podman.sock"),
+        "missing Podman socket guidance:\n{clean}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_check_podman_uses_compute_driver_env() {
+    let (output, code) = run_with_fake_podman(&["doctor", "check"], true, true).await;
+    let clean = strip_ansi(&output);
+
+    assert_eq!(code, 0, "Podman doctor check should pass:\n{clean}");
+    assert!(clean.contains("Podman"), "driver env should select Podman:\n{clean}");
+    assert!(!clean.contains("Docker"), "Podman selection should not run Docker:\n{clean}");
+}
+
+#[tokio::test]
+async fn doctor_check_podman_failure_is_actionable() {
+    let (output, code) =
+        run_with_fake_podman(&["doctor", "check", "--driver", "podman"], false, false).await;
+    let clean = strip_ansi(&output);
+
+    assert_ne!(code, 0, "unreachable Podman should fail:\n{clean}");
+    assert!(clean.contains("FAILED"), "failure should be labeled:\n{clean}");
+    assert!(clean.contains("CONTAINER_HOST"), "error should mention CONTAINER_HOST:\n{clean}");
+    assert!(clean.contains("podman info"), "error should suggest podman info:\n{clean}");
 }
